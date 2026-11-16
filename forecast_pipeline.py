@@ -43,6 +43,8 @@ LARGE_WINDOW = 36            # months used to estimate the expected large-order 
 TRAIN_START = pd.Timestamp("2021-10-01")   # first month with all features available
 TEST_START = pd.Timestamp("2025-01-01")    # first month forecast out-of-sample
 APPROACHES = {"H1": 1, "H3": 3, "H6": 6}   # approach name -> number of months ahead
+MAX_NULL_SHARE = 0.5         # drop a feature that is blank in more than half of the months with actuals
+MIN_TRAIN_ROWS = 12          # an ML model needs at least this many complete months to be fitted
 
 
 # --------------------------------------------------------------------------------------
@@ -180,6 +182,17 @@ def build_features(df: pd.DataFrame, extra_months: int = 2) -> tuple[pd.DataFram
     ratios.loc[ratios.index < "2021-10-01", ["conv_cohort_n", "conv_cohort_value", "expected_pipeline_value"]] = np.nan
     feat = feat.join(ratios)
 
+    # ---- gaps and empty features ----
+    # Ratios are blank in months whose look-back window had no orders (or no quotes):
+    # carry the last known value forward. Uses only earlier months, so nothing leaks.
+    known = feat.index <= last_actual + pd.DateOffset(months=1)
+    feat.loc[known, ratios.columns] = feat.loc[known, ratios.columns].ffill()
+    # Drop features that are still blank in most months with actuals (e.g. an input column empty in the extract)
+    null_share = feat.loc[:last_actual].drop(columns=targets).isna().mean()
+    dropped = null_share[null_share > MAX_NULL_SHARE]
+    feat = feat.drop(columns=dropped.index)
+    feat.attrs["dropped_features"] = dropped.round(2).to_dict()
+
     # Months more than 1 step past the data depend on activity not seen yet -> unknown, not zero
     unseen = feat.index > last_actual + pd.DateOffset(months=1)
     feat.loc[unseen, [c for c in feat if c not in targets and not c.startswith(
@@ -230,11 +243,17 @@ def design_matrix(feat: pd.DataFrame, h: int, horizon_end: pd.Timestamp | None =
              "regular_value_lag12_target": y.get(M - pd.DateOffset(months=12), np.nan),
              "n_orders_lag12_target": feat["n_orders"].get(M - pd.DateOffset(months=12), np.nan)}
         for c in ORIGIN_FEATURES:
-            r[c] = feat[c].get(row_T1, np.nan)
+            if c in feat.columns:              # skip features dropped by build_features
+                r[c] = feat[c].get(row_T1, np.nan)
         r["y_regular"] = y.get(M, np.nan)
         r["y_total"] = feat["order_value"].get(M, np.nan)
         rows.append(r)
     return pd.DataFrame(rows).set_index("target_month")
+
+
+def active_features(X: pd.DataFrame) -> list[str]:
+    """ML_FEATURES present in the design matrix with at least one value (dropped features are skipped)."""
+    return [c for c in ML_FEATURES if c in X.columns and X[c].notna().any()]
 
 
 def expected_large(feat: pd.DataFrame, origin: pd.Timestamp, window: int = LARGE_WINDOW) -> float:
@@ -343,10 +362,14 @@ def _ml_model(make_model):
         preds = []
         for h in range(1, H + 1):
             X = designs[h]
-            train = X[(X.index <= origin) & (X.index >= TRAIN_START)].dropna(subset=ML_FEATURES + ["y_regular"])
-            model = make_model().fit(train[ML_FEATURES], train["y_regular"])
+            cols = active_features(X)
+            train = X[(X.index <= origin) & (X.index >= TRAIN_START)].dropna(subset=cols + ["y_regular"])
+            if len(train) < MIN_TRAIN_ROWS:
+                preds.append(np.nan)           # not enough complete months yet: no forecast
+                continue
+            model = make_model().fit(train[cols], train["y_regular"])
             target = origin + pd.DateOffset(months=h)
-            preds.append(float(model.predict(X.loc[[target], ML_FEATURES].fillna(train[ML_FEATURES].median()))[0]))
+            preds.append(float(model.predict(X.loc[[target], cols].fillna(train[cols].median()))[0]))
         return preds
     return predict
 
@@ -413,9 +436,12 @@ def run_backtest(feat: pd.DataFrame, last_actual: pd.Timestamp, progress=None) -
             X = designs[h]
             tr = X[(X.index >= TRAIN_START) & (X.index <= train_end)]
             if name in ML_MAKERS:
-                fit_rows = tr.dropna(subset=ML_FEATURES + ["y_regular"])
-                model = ML_MAKERS[name]().fit(fit_rows[ML_FEATURES], fit_rows["y_regular"])
-                preds = pd.Series(model.predict(fit_rows[ML_FEATURES]), index=fit_rows.index)
+                cols = active_features(X)
+                fit_rows = tr.dropna(subset=cols + ["y_regular"])
+                if len(fit_rows) < MIN_TRAIN_ROWS:
+                    continue                   # not enough complete training months for this model
+                model = ML_MAKERS[name]().fit(fit_rows[cols], fit_rows["y_regular"])
+                preds = pd.Series(model.predict(fit_rows[cols]), index=fit_rows.index)
             elif name == "Seasonal baseline":
                 preds = tr["seasonal_baseline"]
             else:   # ARIMA / ETS / SARIMA: in-sample fitted values (one-step) on the training period
@@ -446,6 +472,10 @@ def _metrics(pred, actual):
     R2   : 1 - squared error / variance of actual. 1 = perfect, 0 = no better than the average, < 0 = worse.
     """
     pred, actual = np.asarray(pred, float), np.asarray(actual, float)
+    ok = ~(np.isnan(pred) | np.isnan(actual))      # skip months a model could not forecast
+    pred, actual = pred[ok], actual[ok]
+    if len(pred) == 0:
+        return {k: np.nan for k in METRICS}
     err = pred - actual
     pos = actual > 0
     sst = ((actual - actual.mean()) ** 2).sum()
@@ -513,10 +543,10 @@ def score_table(bt: pd.DataFrame, approach: str) -> pd.DataFrame:
             "Total: test MAE ($M)": t_te["MAE"] / 1e6,
             "Total: test bias": t_te["Bias"],
             f"Total: {H}-month sum error": (period["pred_total"] - period["actual_total"]).abs().sum() / period["actual_total"].sum(),
-            "Test forecasts": len(te),
+            "Test forecasts": int(te["pred_regular"].notna().sum()),
         })
     t = pd.DataFrame(rows).set_index("Model")
-    t["Rank"] = t["Test MAE ($M)"].rank(method="first").astype(int)
+    t["Rank"] = t["Test MAE ($M)"].rank(method="first", na_option="bottom").astype(int)
     return t.sort_values("Rank")
 
 

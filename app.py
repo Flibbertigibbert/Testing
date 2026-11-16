@@ -383,8 +383,13 @@ def page_models(df, feat, last_actual, bt, fc):
                             for f in code_for[name]:
                                 st.code(inspect.getsource(f), language="python")
     st.markdown("#### Features used by the seven machine-learning models")
-    st.write(", ".join(f"`{c}`" for c in fp.ML_FEATURES))
-    st.caption("I kept this to 13 features on purpose: with ~40–60 training months, using all 71 features made the models worse.")
+    used = fp.active_features(fp.design_matrix(feat, 1))
+    st.write(", ".join(f"`{c}`" for c in used))
+    dropped = feat.attrs.get("dropped_features", {})
+    if dropped:
+        st.caption("Dropped because they are blank in most months: "
+                   + ", ".join(f"`{c}` ({v:.0%} blank)" for c, v in dropped.items()))
+    st.caption(f"I kept this to {len(used)} features on purpose: with ~40–60 training months, using all the features made the models worse.")
 
 
 def page_results(df, feat, last_actual, bt, fc):
