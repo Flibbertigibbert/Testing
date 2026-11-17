@@ -306,7 +306,7 @@ def page_approach(df, feat, last_actual, bt, fc):
             with st.container(border=True):
                 st.markdown(f"**{a}: next {H} month{'s' if H > 1 else ''}**")
                 st.caption(f"Made at the end of month T, forecasts T+1{f' … T+{H}' if H > 1 else ''}. "
-                           f"From Oct 2026: {(last_actual + pd.DateOffset(months=1)):%b %Y}"
+                           f"From {last_actual:%b %Y}: {(last_actual + pd.DateOffset(months=1)):%b %Y}"
                            f"{f' – {(last_actual + pd.DateOffset(months=H)):%b %Y}' if H > 1 else ''}.")
 
     st.markdown("""
@@ -322,7 +322,8 @@ same-quarter-position months that are already known.
 """)
 
     st.markdown("#### Train vs test (walk-forward)")
-    first_test, train_start = fp.TEST_START, fp.TRAIN_START
+    tl = fp.feat_timeline(feat)
+    first_test, train_start = tl["test_start"], tl["train_start"]
     fig = go.Figure()
     fig.add_vrect(x0=train_start, x1=first_test - pd.DateOffset(days=1), fillcolor=BLUE, opacity=0.15, line_width=0,
                   annotation_text="TRAIN (fit + in-sample score)", annotation_position="top left")
@@ -342,7 +343,7 @@ same-quarter-position months that are already known.
 
     st.markdown("#### See the design matrix for one horizon")
     h = st.slider("Months ahead (h)", 1, 6, 1)
-    X = fp.design_matrix(feat, h).loc[fp.TRAIN_START:last_actual]
+    X = fp.design_matrix(feat, h).loc[fp.feat_timeline(feat)["train_start"]:last_actual]
     st.dataframe(X.tail(12).style.format(precision=2), width="stretch")
     show_code(fp.design_matrix, "Show the code: design_matrix")
     show_code(fp.seasonal_baseline, "Show the code: seasonal_baseline")

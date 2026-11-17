@@ -40,11 +40,52 @@ OUT_DIR = Path(__file__).with_name("outputs")
 LARGE = 1_000_000            # orders at or above this are "large"
 MATURE_LAG = 9               # quotes this many months old have had time to convert (max observed lag = 8)
 LARGE_WINDOW = 36            # months used to estimate the expected large-order amount
-TRAIN_START = pd.Timestamp("2021-10-01")   # first month with all features available
-TEST_START = pd.Timestamp("2025-01-01")    # first month forecast out-of-sample
+DATA_START = None            # None = first month with quotes in the data; or set a month, e.g. pd.Timestamp(2020, 1, 1)
+PIPELINE_WARMUP = 6          # months of quotes needed before the open-pipeline features are trusted
+TEST_MONTHS = 22             # length of the walk-forward test period, ending at the last month with actuals
+MIN_TRAIN_MONTHS = 24        # the test period never starts before this many training months
 APPROACHES = {"H1": 1, "H3": 3, "H6": 6}   # approach name -> number of months ahead
 MAX_NULL_SHARE = 0.5         # drop a feature that is blank in more than half of the months with actuals
 MIN_TRAIN_ROWS = 12          # an ML model needs at least this many complete months to be fitted
+
+
+# --------------------------------------------------------------------------------------
+# 0. Dates: every date the pipeline uses is worked out from the data
+# --------------------------------------------------------------------------------------
+def data_start(df: pd.DataFrame) -> pd.Timestamp:
+    """First month of the feature table: DATA_START if set, otherwise the first month with quotes."""
+    if DATA_START is not None:
+        return pd.Timestamp(DATA_START).to_period("M").to_timestamp()
+    return df["quote_creation_date"].min().to_period("M").to_timestamp()
+
+
+def timeline(start, last_actual) -> dict:
+    """
+    All the dates the pipeline needs, from the first data month and the last month with actuals:
+      pipeline_ready : open-quote features are trusted from here (PIPELINE_WARMUP months of quotes)
+      cohort_ready   : the mature-cohort features exist from here (MATURE_LAG + 12 months of quotes)
+      train_start    : first month the models train on (= cohort_ready, when every feature exists)
+      test_start     : first walk-forward test month (the last TEST_MONTHS months with actuals)
+    """
+    start, last_actual = pd.Timestamp(start), pd.Timestamp(last_actual)
+    after = lambda n: start + pd.DateOffset(months=n)
+    tl = {"start": start, "pipeline_ready": after(PIPELINE_WARMUP), "cohort_ready": after(MATURE_LAG + 12),
+          "last_actual": last_actual}
+    tl["train_start"] = tl["cohort_ready"]
+    tl["test_start"] = max(last_actual - pd.DateOffset(months=TEST_MONTHS - 1),
+                           tl["train_start"] + pd.DateOffset(months=MIN_TRAIN_MONTHS))
+    if tl["test_start"] > last_actual - pd.DateOffset(months=max(APPROACHES.values()) - 1):
+        months = (last_actual.year - start.year) * 12 + last_actual.month - start.month + 1
+        raise ValueError(
+            f"Only {months} months of data ({start:%b %Y} to {last_actual:%b %Y}). The models need "
+            f"{MATURE_LAG + 12} months of warm-up + {MIN_TRAIN_MONTHS} training months + "
+            f"{max(APPROACHES.values())} test months. Lower MIN_TRAIN_MONTHS or TEST_MONTHS, or use a longer extract.")
+    return tl
+
+
+def feat_timeline(feat: pd.DataFrame) -> dict:
+    """The timeline of a feature table: its first month and its last month with actual orders."""
+    return timeline(feat.index.min(), feat["order_value"].last_valid_index())
 
 
 # --------------------------------------------------------------------------------------
@@ -76,10 +117,12 @@ def build_features(df: pd.DataFrame, extra_months: int = 2) -> tuple[pd.DataFram
     Build the monthly feature table. Row M only uses information available at the START of month M.
     Returns (features, last_actual_month).
     """
+    df = df.assign(order_date_month=df["order_date_month"].dt.to_period("M").dt.to_timestamp())  # month start
     orders = df[df["order_number"].notna()].drop_duplicates("order_number").copy()
     orders["is_large"] = orders["order_value"] >= LARGE
     last_actual = orders["order_date_month"].max()
-    months = pd.date_range("2020-01-01", last_actual + pd.DateOffset(months=extra_months), freq="MS")
+    tl = timeline(data_start(df), last_actual)
+    months = pd.date_range(tl["start"], last_actual + pd.DateOffset(months=extra_months), freq="MS")
 
     def monthly_sum(frame, date_col, value_col):
         return frame.groupby(date_col)[value_col].sum().reindex(months, fill_value=0)
@@ -140,7 +183,7 @@ def build_features(df: pd.DataFrame, extra_months: int = 2) -> tuple[pd.DataFram
     new_o = opps.groupby("opp_month").agg(n=("opp_id", "size"), value=("opp_value", "sum")).reindex(months, fill_value=0)
     feat["new_opps_n_lag1"] = new_o["n"].shift(1)
     feat["new_opps_value_lag1"] = new_o["value"].shift(1)
-    feat.loc[feat.index < "2020-07-01", [c for c in feat if c.startswith("open_quotes")]] = np.nan
+    feat.loc[feat.index < tl["pipeline_ready"], [c for c in feat if c.startswith("open_quotes")]] = np.nan
 
     # ---- conversion, realization, discount, gross margin ----
     o = orders.copy()
@@ -179,7 +222,7 @@ def build_features(df: pd.DataFrame, extra_months: int = 2) -> tuple[pd.DataFram
         rows.append(r)
     ratios = pd.DataFrame(rows, index=months)
     ratios["expected_pipeline_value"] = feat["open_quotes_value_6m"] * ratios["conv_cohort_value"] * ratios["realization_quote_12m"]
-    ratios.loc[ratios.index < "2021-10-01", ["conv_cohort_n", "conv_cohort_value", "expected_pipeline_value"]] = np.nan
+    ratios.loc[ratios.index < tl["cohort_ready"], ["conv_cohort_n", "conv_cohort_value", "expected_pipeline_value"]] = np.nan
     feat = feat.join(ratios)
 
     # ---- gaps and empty features ----
@@ -359,11 +402,12 @@ TS_FITTERS = {"ARIMA": fit_arima, "ETS": fit_ets, "SARIMA": fit_sarima}   # univ
 
 def _ml_model(make_model):
     def predict(feat, origin, H, designs):
+        train_start = feat_timeline(feat)["train_start"]
         preds = []
         for h in range(1, H + 1):
             X = designs[h]
             cols = active_features(X)
-            train = X[(X.index <= origin) & (X.index >= TRAIN_START)].dropna(subset=cols + ["y_regular"])
+            train = X[(X.index <= origin) & (X.index >= train_start)].dropna(subset=cols + ["y_regular"])
             if len(train) < MIN_TRAIN_ROWS:
                 preds.append(np.nan)           # not enough complete months yet: no forecast
                 continue
@@ -405,15 +449,18 @@ def run_backtest(feat: pd.DataFrame, last_actual: pd.Timestamp, progress=None) -
     For every model, approach (H1/H3/H6) and forecast origin, forecast regular order value,
     add the expected large-order amount, and store predictions next to actuals.
 
-    TEST : origins Dec 2024 ... (last_actual - H). Each model is refit using only data up to the origin.
-    TRAIN: models fit once on Oct 2021 - Dec 2024 and scored on those same months (in-sample).
+    TEST : origins from the month before test_start to last_actual - 1. Each model is refit using only data
+           up to the origin; a forecast is scored only where its months have actuals.
+    TRAIN: models fit once on train_start ... the month before test_start, scored on those months (in-sample).
+    Both dates come from feat_timeline(feat), so nothing here is hard-coded.
     """
+    tl = feat_timeline(feat)
     Hmax = max(APPROACHES.values())
     designs = {h: design_matrix(feat, h) for h in range(1, Hmax + 1)}
     out = []
 
     # ---- TEST: walk-forward, refit at every origin ----
-    origins = pd.date_range(TEST_START - pd.DateOffset(months=1), last_actual - pd.DateOffset(months=1), freq="MS")
+    origins = pd.date_range(tl["test_start"] - pd.DateOffset(months=1), last_actual - pd.DateOffset(months=1), freq="MS")
     steps, done = len(MODELS) * len(origins), 0
     for name, fn in MODELS.items():
         for T in origins:
@@ -430,11 +477,11 @@ def run_backtest(feat: pd.DataFrame, last_actual: pd.Timestamp, progress=None) -
                 progress(done / steps, f"{name}: origin {T:%b %Y}")
 
     # ---- TRAIN: in-sample fit on the training period ----
-    train_end = TEST_START - pd.DateOffset(months=1)
+    train_end = tl["test_start"] - pd.DateOffset(months=1)
     for name, fn in MODELS.items():
         for h in range(1, Hmax + 1):
             X = designs[h]
-            tr = X[(X.index >= TRAIN_START) & (X.index <= train_end)]
+            tr = X[(X.index >= tl["train_start"]) & (X.index <= train_end)]
             if name in ML_MAKERS:
                 cols = active_features(X)
                 fit_rows = tr.dropna(subset=cols + ["y_regular"])
