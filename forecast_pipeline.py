@@ -40,23 +40,32 @@ OUT_DIR = Path(__file__).with_name("outputs")
 LARGE = 1_000_000            # orders at or above this are "large"
 MATURE_LAG = 9               # quotes this many months old have had time to convert (max observed lag = 8)
 LARGE_WINDOW = 36            # months used to estimate the expected large-order amount
-DATA_START = None            # None = first month with quotes in the data; or set a month, e.g. pd.Timestamp(2020, 1, 1)
+DATA_START = None            # None = first month with both quotes and orders; or set a month, e.g. pd.Timestamp(2021, 7, 1)
 PIPELINE_WARMUP = 6          # months of quotes needed before the open-pipeline features are trusted
 TEST_MONTHS = 22             # length of the walk-forward test period, ending at the last month with actuals
 MIN_TRAIN_MONTHS = 24        # the test period never starts before this many training months
 APPROACHES = {"H1": 1, "H3": 3, "H6": 6}   # approach name -> number of months ahead
 MAX_NULL_SHARE = 0.5         # drop a feature that is blank in more than half of the months with actuals
 MIN_TRAIN_ROWS = 12          # an ML model needs at least this many complete months to be fitted
+RANK_METRIC = "MAPE"         # how models are ranked and the winner picked, on regular orders: "MAPE", "WAPE" or "MAE"
+MAX_ABS_BIAS = 0.20          # a model can only win if its test bias is within +/-20% (MAPE favours forecasts that are too low)
 
 
 # --------------------------------------------------------------------------------------
 # 0. Dates: every date the pipeline uses is worked out from the data
 # --------------------------------------------------------------------------------------
 def data_start(df: pd.DataFrame) -> pd.Timestamp:
-    """First month of the feature table: DATA_START if set, otherwise the first month with quotes."""
+    """
+    First month of the feature table: DATA_START if set, otherwise the first month that has BOTH quotes and orders.
+    Months before the first order would enter the series as zero sales (orders simply weren't recorded yet),
+    which wrecks the time-series models and the lag features, so the series starts where order history starts.
+    """
     if DATA_START is not None:
         return pd.Timestamp(DATA_START).to_period("M").to_timestamp()
-    return df["quote_creation_date"].min().to_period("M").to_timestamp()
+    first_quote = df["quote_creation_date"].min().to_period("M").to_timestamp()
+    order_months = pd.to_datetime(df["order_date_month"].dropna())
+    first_order = order_months.min().to_period("M").to_timestamp() if len(order_months) else first_quote
+    return max(first_quote, first_order)
 
 
 def timeline(start, last_actual) -> dict:
@@ -560,13 +569,28 @@ def metrics_table(bt: pd.DataFrame, approach: str, target: str = "regular") -> p
     return t[[(m, s) for m in METRICS for s in ("Train", "Test")]]
 
 
+RANK_COLUMNS = {"MAPE": "Test MAPE", "WAPE": "Test WAPE", "MAE": "Test MAE ($M)"}
+
+
+def rank_column() -> str:
+    """The score-table column that RANK_METRIC ranks on."""
+    if RANK_METRIC not in RANK_COLUMNS:
+        raise ValueError(f"RANK_METRIC must be one of {list(RANK_COLUMNS)}, not {RANK_METRIC!r}")
+    return RANK_COLUMNS[RANK_METRIC]
+
+
 def score_table(bt: pd.DataFrame, approach: str) -> pd.DataFrame:
     """
     Comparison table for one approach. H1 uses h=1, H3 uses h=1..3, H6 uses h=1..6.
     Test only uses origins whose whole window has actuals, so every model is scored on the same months.
 
-    Ranking uses REGULAR orders: the expected large-order amount is identical for every model, and
-    total-value MAE rewards forecasts that are too low (most months have no large order).
+    Ranking uses REGULAR orders and RANK_METRIC (MAPE by default, the metric the business reads).
+    The expected large-order amount is identical for every model, so it cannot change the ranking.
+    MAPE caveat: a forecast that is too low can miss by at most 100%, one that is too high by any amount,
+    so MAPE leans towards low forecasts. A model whose test bias is beyond +/-MAX_ABS_BIAS is therefore
+    ranked after every unbiased model, whatever its MAPE ("Eligible" = False). If no model is within the
+    limit, all are ranked on Test WAPE instead.
+    Gap (test / train) = test MAE / train MAE: above 1.5 means the model memorised the training months.
     """
     H = APPROACHES[approach]
     train, test = _approach_rows(bt, approach)
@@ -578,28 +602,41 @@ def score_table(bt: pd.DataFrame, approach: str) -> pd.DataFrame:
         period = te.groupby("origin")[["pred_total", "actual_total"]].sum()
         rows.append({
             "Model": name,
-            "Train MAE ($M)": r_tr["MAE"] / 1e6,
-            "Test MAE ($M)": r_te["MAE"] / 1e6,
-            "Gap (test / train)": r_te["MAE"] / r_tr["MAE"],
+            "Train MAPE": r_tr["MAPE"],
             "Test MAPE": r_te["MAPE"],
-            "Test RMSE ($M)": r_te["RMSE"] / 1e6,
             "Test WAPE": r_te["WAPE"],
             "Test bias": r_te["Bias"],
+            "Train MAE ($M)": r_tr["MAE"] / 1e6,
+            "Test MAE ($M)": r_te["MAE"] / 1e6,
+            "Gap (test / train)": r_te["MAE"] / r_tr["MAE"] if r_tr["MAE"] else np.nan,
+            "Test RMSE ($M)": r_te["RMSE"] / 1e6,
             "Train R2": r_tr["R2"],
             "Test R2": r_te["R2"],
+            "Total: test MAPE": t_te["MAPE"],
             "Total: test MAE ($M)": t_te["MAE"] / 1e6,
             "Total: test bias": t_te["Bias"],
             f"Total: {H}-month sum error": (period["pred_total"] - period["actual_total"]).abs().sum() / period["actual_total"].sum(),
             "Test forecasts": int(te["pred_regular"].notna().sum()),
         })
     t = pd.DataFrame(rows).set_index("Model")
-    t["Rank"] = t["Test MAE ($M)"].rank(method="first", na_option="bottom").astype(int)
-    return t.sort_values("Rank")
+    t["Eligible"] = t["Test bias"].abs() <= MAX_ABS_BIAS          # NaN bias (no forecasts) -> not eligible
+    if t["Eligible"].any():
+        t = t.sort_values(["Eligible", rank_column()], ascending=[False, True], na_position="last")
+    else:   # every model is biased beyond the limit: rank on WAPE, which doesn't favour low forecasts
+        t = t.sort_values("Test WAPE", na_position="last")
+    t["Rank"] = range(1, len(t) + 1)
+    return t
+
+
+def best_models(bt: pd.DataFrame) -> dict:
+    """Winner per approach: lowest test RANK_METRIC among models with |test bias| <= MAX_ABS_BIAS."""
+    return {a: score_table(bt, a).index[0] for a in APPROACHES}
 
 
 def summary_table(bt: pd.DataFrame) -> pd.DataFrame:
-    """Test MAE on regular orders ($M) for every model x approach."""
-    return pd.DataFrame({a: score_table(bt, a)["Test MAE ($M)"] for a in APPROACHES}).loc[list(MODELS)]
+    """The ranking column (RANK_METRIC on regular orders) for every model x approach. MAPE/WAPE are fractions, MAE is $M."""
+    col = rank_column()
+    return pd.DataFrame({a: score_table(bt, a)[col] for a in APPROACHES}).loc[list(MODELS)]
 
 
 # --------------------------------------------------------------------------------------
@@ -607,7 +644,8 @@ def summary_table(bt: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------------------
 def final_forecast(feat: pd.DataFrame, last_actual: pd.Timestamp, bt: pd.DataFrame) -> pd.DataFrame:
     """
-    Forecast from origin = last_actual with the best model (lowest test MAE) for each approach.
+    Forecast from origin = last_actual with the best model for each approach (see score_table: lowest test
+    RANK_METRIC among models whose test bias is within +/-MAX_ABS_BIAS).
     The low-high range is the 10th-90th percentile of that model's test errors at the same h.
     """
     Hmax = max(APPROACHES.values())
@@ -656,7 +694,7 @@ if __name__ == "__main__":
     for a in APPROACHES:
         print(f"\n=== {a} ===")
         print(score_table(bt, a).round(3).to_string())
-    print("\n=== Summary (test MAE $M) ===")
+    print(f"\n=== Summary (test {RANK_METRIC}, regular orders) ===")
     print(summary_table(bt).round(3).to_string())
     print("\n=== Final forecast ===")
     print(fc.round(0).to_string())

@@ -403,11 +403,12 @@ def page_results(df, feat, last_actual, bt, fc):
     t = fp.score_table(bt, approach)
     sum_col = [c for c in t.columns if "sum error" in c][0]
 
-    st.markdown("#### Comparison table (regular orders, ranked by test MAE)")
-    fmt = {"Train MAE ($M)": "{:.3f}", "Test MAE ($M)": "{:.3f}", "Gap (test / train)": "{:.2f}×",
-           "Test MAPE": "{:.1%}", "Test RMSE ($M)": "{:.3f}", "Test WAPE": "{:.1%}", "Test bias": "{:+.1%}",
-           "Train R2": "{:.2f}", "Test R2": "{:.2f}",
-           "Total: test MAE ($M)": "{:.3f}", "Total: test bias": "{:+.1%}", sum_col: "{:.1%}"}
+    st.markdown(f"#### Comparison table (regular orders, ranked by test {fp.RANK_METRIC})")
+    fmt = {"Train MAPE": "{:.1%}", "Test MAPE": "{:.1%}", "Test WAPE": "{:.1%}", "Test bias": "{:+.1%}",
+           "Train MAE ($M)": "{:.3f}", "Test MAE ($M)": "{:.3f}", "Gap (test / train)": "{:.2f}×",
+           "Test RMSE ($M)": "{:.3f}", "Train R2": "{:.2f}", "Test R2": "{:.2f}",
+           "Total: test MAPE": "{:.1%}", "Total: test MAE ($M)": "{:.3f}", "Total: test bias": "{:+.1%}",
+           sum_col: "{:.1%}"}
     styled = (t.style.format(fmt)
               .highlight_min(subset=["Test MAE ($M)", "Test RMSE ($M)", "Test WAPE", "Test MAPE"], color="#bbf7d0")
               .highlight_max(subset=["Test R2"], color="#bbf7d0")
@@ -420,6 +421,7 @@ def page_results(df, feat, last_actual, bt, fc):
   Large orders are random and identical for every model, so they don't change the ranking.
 - **{sum_col}:** error on the sum over the {fp.APPROACHES[approach]} month(s), which is what matters for planning.
 - **Why rank on regular orders?** A model that always forecasts too low wins on total MAE, because most months have no large order.
+- **Ranking metric:** {fp.RANK_METRIC} (set `RANK_METRIC` in `forecast_pipeline.py`). MAPE leans towards forecasts that are too low, so a model whose **Test bias** is beyond ±{fp.MAX_ABS_BIAS:.0%} can't win (**Eligible** = False). **Total: test MAPE** is comparable with the first round's MAPE.
 - **Why is test R² near or below 0?** Regular order value swings a lot from month to month; even the best model explains
   little of that swing. A high *train* R² with a negative *test* R² is the clearest sign of overfitting.
 """)
@@ -448,9 +450,13 @@ def page_results(df, feat, last_actual, bt, fc):
         fig.update_layout(height=380, legend=dict(orientation="h", y=-0.25))
         st.plotly_chart(fig, width="stretch")
 
-    st.markdown("#### Summary: test MAE on regular orders ($M)")
+    st.markdown(f"#### Summary: test {fp.RANK_METRIC} on regular orders" + (" ($M)" if fp.RANK_METRIC == "MAE" else ""))
     summary = fp.summary_table(bt)
-    st.dataframe(summary.style.format("{:.3f}").highlight_min(axis=0, color="#bbf7d0"), width="stretch")
+    sfmt = "{:.3f}" if fp.RANK_METRIC == "MAE" else "{:.1%}"
+    winners = fp.best_models(bt)
+    mark = lambda col: ["background-color:#bbf7d0" if m == winners[col.name] else "" for m in col.index]
+    st.dataframe(summary.style.format(sfmt).apply(mark, axis=0), width="stretch")
+    st.caption(f"Highlighted: the winner per approach, the lowest {fp.RANK_METRIC} among models with bias within ±{fp.MAX_ABS_BIAS:.0%}.")
 
     st.markdown("#### Actual vs forecast (test months)")
     c1, c2 = st.columns([2, 1])
@@ -466,7 +472,7 @@ def page_results(df, feat, last_actual, bt, fc):
     fig.update_layout(height=380, yaxis_title="Regular order value ($M)", legend=dict(orientation="h"))
     st.plotly_chart(fig, width="stretch")
 
-    best = summary.idxmin()
+    best = pd.Series(winners)
     over = t.index[t["Gap (test / train)"] > 1.5].tolist()
     st.markdown("#### Takeaways")
     st.markdown(f"""
