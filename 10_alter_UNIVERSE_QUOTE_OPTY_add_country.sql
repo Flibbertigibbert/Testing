@@ -42,3 +42,12 @@ GO
 -- FROM [eap].[UNIVERSE_QUOTE_OPTY]
 -- GROUP BY country_code, go_to_mkt_rt_nm
 -- ORDER BY country_code, go_to_mkt_rt_nm;
+
+
+UPDATE eap.UNIVERSE_QUOTE_OPTY
+SET country_code = 'US', go_to_mkt_rt_nm = 'INDIRECT'
+WHERE create_date <  '2026-11-23 00:00:00';   -- cutoff: before the Direct load
+
+UPDATE eap.UNIVERSE_QUOTE_OPTY
+SET country_code = 'US', go_to_mkt_rt_nm = 'DIRECT'
+WHERE create_date >= '2026-11-23 00:00:00';
